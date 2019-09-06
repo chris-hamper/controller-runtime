@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"time"
 
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -32,6 +33,14 @@ import (
 type Options struct {
 	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run. Defaults to 1.
 	MaxConcurrentReconciles int
+	
+	// BaseFailureDelay is the shortest backoff delay used upon a Reconcile error. This, along with MaxFailureDelay,
+	// tunes exponential backoff rate limiting of the Controller work queue. Defaults to 5 milliseconds.
+	BaseFailureDelay time.Duration
+
+	// MaxFailureDelay is the longest backoff delay used upon a Reconcile error. This, along with BaseFailureDelay,
+	// tunes exponential backoff rate limiting of the Controller work queue. Defaults to 1000 seconds.
+	MaxFailureDelay time.Duration
 
 	// Reconciler reconciles an object
 	Reconciler reconcile.Reconciler
@@ -42,19 +51,17 @@ type Options struct {
 // Work typically is reads and writes Kubernetes objects to make the system state match the state specified
 // in the object Spec.
 type Controller interface {
-	// Reconciler is called to reconcile an object by Namespace/Name
+	// Reconciler is called to Reconciler an object by Namespace/Name
 	reconcile.Reconciler
 
-	// Watch takes events provided by a Source and uses the EventHandler to
-	// enqueue reconcile.Requests in response to the events.
+	// Watch takes events provided by a Source and uses the EventHandler to enqueue reconcile.Requests in
+	// response to the events.
 	//
-	// Watch may be provided one or more Predicates to filter events before
-	// they are given to the EventHandler.  Events will be passed to the
-	// EventHandler if all provided Predicates evaluate to true.
+	// Watch may be provided one or more Predicates to filter events before they are given to the EventHandler.
+	// Events will be passed to the EventHandler iff all provided Predicates evaluate to true.
 	Watch(src source.Source, eventhandler handler.EventHandler, predicates ...predicate.Predicate) error
 
-	// Start starts the controller.  Start blocks until stop is closed or a
-	// controller has an error starting.
+	// Start starts the controller.  Start blocks until stop is closed or a controller has an error starting.
 	Start(stop <-chan struct{}) error
 }
 
@@ -72,23 +79,34 @@ func New(name string, mgr manager.Manager, options Options) (Controller, error) 
 	if options.MaxConcurrentReconciles <= 0 {
 		options.MaxConcurrentReconciles = 1
 	}
+	
+	if options.BaseFailureDelay <= 0 {
+		options.BaseFailureDelay = 5*time.Millisecond
+	}
+
+	if options.MaxFailureDelay <= 0 {
+		options.MaxFailureDelay = 1000*time.Second
+	}
 
 	// Inject dependencies into Reconciler
 	if err := mgr.SetFields(options.Reconciler); err != nil {
 		return nil, err
 	}
 
+	// Create rate limiter for the work queue
+	rateLimiter := workqueue.NewControllerRateLimiter(options.BaseFailureDelay, options.MaxFailureDelay)
+	
 	// Create controller with dependencies set
 	c := &controller.Controller{
-		Do:                      options.Reconciler,
-		Cache:                   mgr.GetCache(),
-		Config:                  mgr.GetConfig(),
-		Scheme:                  mgr.GetScheme(),
-		Client:                  mgr.GetClient(),
-		Recorder:                mgr.GetEventRecorderFor(name),
-		Queue:                   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), name),
+		Do:       options.Reconciler,
+		Cache:    mgr.GetCache(),
+		Config:   mgr.GetConfig(),
+		Scheme:   mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Recorder: mgr.GetRecorder(name),
+		Queue:    workqueue.NewNamedRateLimitingQueue(rateLimiter, name),
 		MaxConcurrentReconciles: options.MaxConcurrentReconciles,
-		Name:                    name,
+		Name: name,
 	}
 
 	// Add the controller as a Manager components
